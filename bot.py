@@ -170,8 +170,12 @@ class Bot:
         self.sounds = []             # (t, bearing, kind, dist)
         self.retreat = None
         self.retreat_t = -99.0
+        self.hide_pt = None
+        self.hide_t = -99.0
+        self.recover_until = -99.0
         self.strafe_dir = 1
         self.strafe_until = 0.0
+        self.jink_boost = False
         self.hist = deque(maxlen=16)
         self.stuck_until = -1.0
         self.stuck_turn = 0.0
@@ -181,6 +185,8 @@ class Bot:
         self.loot_until = 0.0
         self.bad_loot = {}
         self.pending_take = None
+        self.known_pickups = {}      # id -> pickup dict (weapons never despawn)
+        self.arm_goal = None
         self.climb = False
         self.t = 0.0
 
@@ -341,6 +347,15 @@ class Bot:
             self.mode = "zone"
             move = self.nav_dir(me, self.home)
             boost = me["energy"] > 8
+        elif self.arm_target(me, threats, z, t) is not None:
+            self.mode = "arm"
+            ap = self.arm_goal
+            if self.w.line_walkable(pos, ap) or d2(pos, ap) < 8:
+                move = self.straight_dir(pos, ap)
+            else:
+                self.set_goal(ap, deadline)
+                move = self.nav_dir(me, ap)
+            boost = me["energy"] > 25 and d2(pos, ap) > 10
         elif target is not None and self.should_retreat(me, threats, target, t):
             self.mode = "retreat"
             rp = self.retreat_point(me, threats, z, t)
@@ -349,6 +364,13 @@ class Bot:
         elif target is not None:
             self.mode = "fight"
             move = self.fight_move(me, target, z, t)
+            boost = self.jink_boost and me["energy"] > 20
+            grab = self.grab_nearby(obs, me, z, t)
+            if grab is not None:
+                move = grab
+        elif hp_frac < 0.7 and t - self.last_dmg_t < 25 and self._rec(me, z, t) is not None:
+            self.mode = "recover"
+            move = self._rec_move
         else:
             lm = self.loot(obs, me, z, t, hp_frac, act)
             if lm is not None:
@@ -437,11 +459,19 @@ class Bot:
                 self.last_hit_t = t
             elif ty == "took":
                 self.pending_take = None
+                self.known_pickups.pop(ev.get("id"), None)
+                self.arm_goal = None
             elif ty == "take_failed":
                 self.bad_loot[ev.get("id")] = t
                 self.pending_take = None
             elif ty == "kill":
                 self.enemies.pop(ev.get("target"), None)
+        for p in obs["pickups"]:
+            self.known_pickups[p["id"]] = dict(p, t=t)
+        vis = {p["id"] for p in obs["pickups"]}
+        for k in [k for k, p in self.known_pickups.items()
+                  if k not in vis and (d2(p["pos"], me["pos"]) < 25 or k in self.bad_loot)]:
+            del self.known_pickups[k]
         for s in obs["sounds"]:
             if s["kind"] in ("gun", "laser", "lightning", "mortar", "step", "boost", "laser_charge", "jet", "reload"):
                 self.sounds.append((t - s.get("age", 0), s["bearing"], s["kind"], s["dist"]))
@@ -467,8 +497,12 @@ class Bot:
                 continue
             attacked = t - self.last_dmg_by.get(e["id"], -99) < 6
             hpf = e["hp"] / max(1.0, e["max_hp"])
-            # engage only when it matters: close, attacking us, weak, or late game
-            if not (attacked or d < 100 or (hpf < 0.4 and d < 170) or self.t > 330):
+            # engage when it matters: attacking us, close, hunting us (aiming at us / closing), weak, or late
+            bx, by_ = me["pos"][0] - e["pos"][0], me["pos"][1] - e["pos"][1]
+            bn = math.hypot(bx, by_) or 1.0
+            aiming = abs(wrap(e.get("aim", [9, 0])[0] - math.atan2(by_, bx))) < 0.35
+            closing = (e["vel"][0] * bx + e["vel"][1] * by_) / bn > 3.0
+            if not (attacked or d < 100 or (d < 175 and (aiming or closing)) or (hpf < 0.4 and d < 175) or self.t > 330):
                 continue
             sc = d + 160 * hpf - (120 if attacked else 0) - (40 if t - e["t"] < 0.2 else 0)
             if best is None or sc < best[0]:
@@ -479,13 +513,15 @@ class Bot:
     def should_retreat(self, me, threats, target, t):
         hp = me["hp"]; hpf = hp / max(1.0, me["max_hp"])
         close = [e for e in threats if e["dist"] < 120]
-        if self.mode == "retreat":
-            # keep retreating until healed a bit or nobody close
-            if hpf < 0.6 and close:
-                return True
-        if hpf < 0.35 and (target["hp"] > hp * 0.7 or len(close) >= 2):
+        shooting = [e for e in close if t - self.last_dmg_by.get(e["id"], -99) < 4]
+        if self.mode == "retreat" and hpf < 0.5 and len(close) >= 2:
             return True
-        if len(close) >= 3 and hpf < 0.8:
+        if len(shooting) >= 2 and hpf < 0.6 and target["hp"] > hp * 0.5:
+            return True
+        if len(close) >= 3 and hpf < 0.85:
+            return True
+        # a lone duel: fight it out unless it is clearly lost
+        if len(close) <= 1 and hpf < 0.2 and target["hp"] > hp * 2.5:
             return True
         return False
 
@@ -518,23 +554,77 @@ class Bot:
         self.retreat_t = t
         return self.retreat
 
+    def _rec(self, me, z, t):
+        self._rec_move = self.recover_move(me, z, t)
+        return self._rec_move
+
+    def recover_move(self, me, z, t):
+        """Hide from where enemies were last seen while regenerating."""
+        eyes = sorted(((e["pos"][0], e["pos"][1], e["pos"][2] + 8.0) for e in self.enemies.values()
+                       if t - e["t"] < 20 and d2(e["pos"], me["pos"]) < 220), key=lambda e: d2(e, me["pos"]))[:2]
+        if not eyes:
+            return None
+        pos = me["pos"]
+        if not any(self.w.los(ey, (pos[0], pos[1], pos[2] + 6.0)) for ey in eyes):
+            return (0.0, 0.0)          # already hidden: stand still and regen
+        hp_ = self.find_hide(me, eyes, z, t)
+        if hp_ is None:
+            return None
+        return self.straight_dir(pos, hp_)
+
+    def find_hide(self, me, eyes, z, t):
+        """Nearest reachable spot (<= 14 m) that none of `eyes` can see. Cached briefly."""
+        if self.hide_pt is not None and t - self.hide_t < 0.6:
+            return self.hide_pt
+        w = self.w
+        pos = me["pos"]
+        best = None
+        ey = min(eyes, key=lambda e: d2(e, pos))
+        stop = time.perf_counter() + 0.004
+        for r in (6.0, 12.0):
+            for q in range(10):
+                a = q * TAU / 10 + 0.3 * (r > 7)
+                x = pos[0] + math.cos(a) * r; y = pos[1] + math.sin(a) * r
+                if not w.walkable_at(x, y) or not self.in_safe((x, y), z, 30):
+                    continue
+                if w.los(ey, (x, y, w.ground(x, y) + 6.0)) or not w.line_walkable(pos, (x, y)):
+                    continue
+                best = (x, y)
+                break
+            if best or time.perf_counter() > stop:
+                break
+        self.hide_pt = best
+        self.hide_t = t
+        return best
+
     def fight_move(self, me, tg, z, t):
         pos = me["pos"]
         w = self.w
         d = tg["dist"]
+        gun = me["weapons"][0]
+        eyes = [(e["pos"][0], e["pos"][1], e["pos"][2] + 8.0) for e in self.fresh_threats(me, t) if e["dist"] < 220][:3]
+        reloading = gun is not None and gun["kind"] == "gun" and (gun.get("reload", 0) > 0.25 or gun.get("ammo", 12) == 0)
+        has_lightning = any(x and x["kind"] == "lightning" for x in me["weapons"])
+        if eyes and reloading and not (has_lightning and d < 40):
+            hp_ = self.find_hide(me, eyes, z, t)
+            if hp_ is not None:
+                self.mode = "duck"
+                return self.straight_dir(pos, hp_) if d2(pos, hp_) > 1.5 else (0.0, 0.0)
         to = self.straight_dir(pos, tg["pos"])
         kinds = [x["kind"] for x in me["weapons"] if x]
         their = tg.get("weapons") or []
         want = None
-        if "lightning" in kinds and d > 38 and me["hp"] >= tg["hp"] * 0.9 and d < 90:
+        if "lightning" in kinds and d > 30 and me["hp"] >= tg["hp"] * 0.5 and d < 140:
             want = 1      # close in
         elif "lightning" in their and "lightning" not in kinds and d < 55:
             want = -1     # stay out of arc range
         elif d < 18:
             want = -1
         if t > self.strafe_until:
-            self.strafe_dir = -self.strafe_dir
-            self.strafe_until = t + 0.6 + self.rng.random() * 0.9
+            if self.rng.random() < 0.8:
+                self.strafe_dir = -self.strafe_dir
+            self.strafe_until = t + 0.3 + self.rng.random() * 0.45
+            self.jink_boost = me["energy"] > 35 and self.rng.random() < 0.6
         sx, sy = -to[1] * self.strafe_dir, to[0] * self.strafe_dir
         mx, my = sx, sy
         if want == 1:
@@ -567,7 +657,7 @@ class Bot:
         aim = None
         cur = me["aim"]
         weapons = me["weapons"]
-        healing = self.mode == "retreat" and d > 60
+        healing = self.mode == "retreat" and d > 140
         for slot in (1, 0):
             wp = weapons[slot] if slot < len(weapons) else None
             if not wp:
@@ -584,8 +674,9 @@ class Bot:
                 pa = math.atan2(p[2] - mz, d2(pos, p))
                 if aim is None:
                     aim = (ya, pa)
-                tol = max(0.012, math.atan2(1.8, max(1.0, d)))
-                ok = abs(wrap(cur[0] - ya)) < tol and abs(cur[1] - pa) < tol * 1.5
+                rad = 2.5 * (1 + 0.05 * (tg.get("cubes") or 0))
+                tol = math.atan2(rad * 1.1, max(1.0, d)) + 0.006
+                ok = abs(wrap(cur[0] - ya)) < tol and abs(cur[1] - pa) < tol * 2.0
                 if clear and ok and d < st.get("range", 230) and wp.get("reload", 0) == 0 and not healing:
                     fire[slot] = True
             elif k == "lightning":
@@ -675,8 +766,8 @@ class Bot:
     def loot(self, obs, me, z, t, hp_frac, act):
         pos = me["pos"]
         w = self.w
-        recent = max([e["t"] for e in self.enemies.values()] + [-99.0])
-        calm = t - recent > 6 and t - self.last_dmg_t > 6
+        near_threat = any(t - e["t"] < 3 and d2(e["pos"], pos) < 150 for e in self.enemies.values())
+        calm = not near_threat and t - self.last_dmg_t > 3
         self.loot_target = None
         if not calm:
             return None
@@ -748,6 +839,59 @@ class Bot:
         self.bad_loot[item.get("id")] = t
         self.loot_target = None
         return None
+
+    def arm_target(self, me, threats, z, t):
+        slot1 = me["weapons"][1] if len(me["weapons"]) > 1 else None
+        cur = PREF.get(slot1["kind"], 0) if slot1 else -1
+        if cur >= PREF["lightning"]:
+            self.arm_goal = None
+            return None
+        pos = me["pos"]
+        held = [x["kind"] for x in me["weapons"] if x]
+        tclose = min([e["dist"] for e in threats] + [999])
+        best = None
+        for p in self.known_pickups.values():
+            if p["kind"] in held or t - self.bad_loot.get(p["id"], -99) < 8:
+                continue
+            gain = PREF.get(p["kind"], 0) - cur
+            if gain <= 0.4:
+                continue
+            d = d2(pos, p["pos"])
+            lim = 170 if slot1 is None else 70
+            if d > lim or abs(p["pos"][2] - self.w.ground(p["pos"][0], p["pos"][1])) > 3 or not self.in_safe(p["pos"], z, 30):
+                continue
+            # with an enemy close, only go if the weapon is nearer than the fight
+            if tclose < 60 and d > max(25.0, tclose * 0.8):
+                continue
+            sc = d - 25 * gain
+            if best is None or sc < best[0]:
+                best = (sc, p)
+        if best is None:
+            self.arm_goal = None
+            return None
+        self.arm_goal = (best[1]["pos"][0], best[1]["pos"][1])
+        return best[1]
+
+    def grab_nearby(self, obs, me, z, t):
+        """Mid-fight: a cube or a better weapon within a few strides is worth stepping to."""
+        pos = me["pos"]
+        held = [x["kind"] for x in me["weapons"] if x]
+        slot1 = me["weapons"][1] if len(me["weapons"]) > 1 else None
+        best = None
+        for c in obs["cubes"]:
+            d = d2(pos, c["pos"])
+            if d < 22 and abs(c["pos"][2] - pos[2]) < 3.5 and (best is None or d < best[0]):
+                best = (d, c["pos"])
+        for p in obs["pickups"]:
+            if p["kind"] in held:
+                continue
+            gain = PREF.get(p["kind"], 0) - (PREF.get(slot1["kind"], 0) if slot1 else -1)
+            d = d2(pos, p["pos"])
+            if gain > 0.4 and d < 28 and abs(p["pos"][2] - pos[2]) < 3.5 and (best is None or d - 8 < best[0]):
+                best = (d - 8, p["pos"])
+        if best is None or not self.w.line_walkable(pos, best[1]):
+            return None
+        return self.straight_dir(pos, best[1])
 
     def shoot_loot(self, me, t):
         kind, item = self.loot_target
